@@ -1,11 +1,7 @@
-﻿using System;
-using System.IO;
-using System.Linq;
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using Newtonsoft.Json;
 using Renci.SshNet;
 using System.Text;
-using Renci.SshNet.Security;
 using System.Globalization;
 
 class Program
@@ -17,7 +13,6 @@ class Program
 
         if (!File.Exists(configPath))
         {
-            Console.WriteLine("No config found.");
             config = SetupProcess(configPath);
         }
         else
@@ -26,7 +21,7 @@ class Program
         }
 
         // if the save file doesn't exist, call SetupProcess()
-        if (!File.Exists(config.SaveFilePath))
+        if (!File.Exists(GetLatestSave(config.SaveName)))
         {
             SetupProcess(configPath);
         }
@@ -36,18 +31,18 @@ class Program
             using (var sftp = new SftpClient(GetConnectionInfo(config)))
             {
                 DownloadProcess(sftp, config);
-                var startingLastModified = File.GetLastWriteTime(config.SaveFilePath);
+                var startingLastModified = File.GetLastWriteTime(GetLatestSave(config.SaveName));
 
                 RunGame();
 
-                var endingLastModified = File.GetLastWriteTime(config.SaveFilePath);
+                var endingLastModified = File.GetLastWriteTime(GetLatestSave(config.SaveName));
 
                 if (endingLastModified != startingLastModified)
                 {
                     UploadProcess(sftp, config);
                 } else
                 {
-                    Console.WriteLine($"No changes detected to save file (Start: {startingLastModified.ToString()}, End: {endingLastModified.ToString()}. Skipping upload.");
+                    Console.WriteLine($"\nSave file hasn't changed. Skipping upload.");
                 }
             }
         } catch (Exception e)
@@ -65,17 +60,20 @@ class Program
         {
             Host = "",
             Username = "",
-            SaveFilePath = ""
+            SaveName = ""
         };
 
         string saveGamesDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FactoryGame", "Saved", "SaveGames");
         string firstDirectory = Directory.GetDirectories(saveGamesDirectory).FirstOrDefault();
+
 
         if (firstDirectory == null)
         {
             Console.WriteLine("Error: No save game folder found. Make sure Satisfactory is installed.");
             Environment.Exit(0);
         }
+
+        Console.WriteLine("Welcome to SyncFactory! This program will help you set up your Satisfactory save file for syncing.\n");
 
         // create config directory
         var configDirectory = Path.GetDirectoryName(configPath);
@@ -84,13 +82,13 @@ class Program
             Directory.CreateDirectory(Path.GetDirectoryName(configPath));
         }
 
-        Console.WriteLine("Enter SFTP Host: ");
+        Console.Write("Enter SFTP Host: ");
         config.Host = Console.ReadLine();
 
-        Console.WriteLine("Enter SFTP Username: ");
+        Console.Write("Enter SFTP Username: ");
         config.Username = Console.ReadLine();
 
-        Console.WriteLine("Paste SSH Private Key: \n");
+        Console.WriteLine($"Paste SSH Private Key for {config.Username}@{config.Host}: \n");
         StringBuilder input = new StringBuilder();
         string line;
         while ((line = Console.ReadLine()) != "")
@@ -103,38 +101,49 @@ class Program
 
         using (var sftp = new SftpClient(GetConnectionInfo(config)))
         {
-            sftp.Connect();
+            Connect(config, sftp);
 
-            Console.WriteLine("Do you want to download an existing world file or upload your own? (Enter 'download' or 'upload')");
+            Console.WriteLine("\nDo you want to download an existing world file or upload your own? (Enter 'download' or 'upload'):");
             string choice = Console.ReadLine();
 
             if (choice == "download")
             {
-                Console.WriteLine("List of save files on the server:");
+                Console.WriteLine("\nSAVES:");
+                Console.WriteLine("--------------------");
 
                  //List all save files on the server and prompt the user for their choice
-                var files = sftp.ListDirectory("/");
+                var saves = sftp.ListDirectory("/saves").Where(file => file.Name != "." && file.Name != "..").ToList();
 
-                foreach (var file in files)
+                var i = 1;
+                foreach (var save in saves)
                 {
-                    Console.WriteLine(file.Name);
+                    Console.WriteLine($" {i}. {save.Name}");
                 }
 
-                Console.WriteLine("Enter the number of the save file you want to download:");
+                Console.WriteLine("--------------------");
+
+                Console.Write("\nEnter save number to download:");
                 int selectedFileIndex = int.Parse(Console.ReadLine());
 
                  //Download the selected save file to the first directory in the local save games folder
-                string selectedFile = files.ElementAt(selectedFileIndex - 1).Name;
-                string saveFilePath = Path.Combine(firstDirectory, Path.GetFileName(selectedFile));
+                var selectedSave = saves.ElementAt(selectedFileIndex - 1);
+                string saveFilePath = Path.Combine(firstDirectory, $"{selectedSave.Name}_autosave_0.sav");
 
-                if (File.Exists(saveFilePath))
+                // Find files that begin with the selectedFolder name (delimited by _autosave*)
+                string[] existingSaveFiles = Directory.GetFiles(firstDirectory, $"{selectedSave.Name}_autosave*.sav");
+
+                if (existingSaveFiles.Length > 0)
                 {
-                    Console.WriteLine("A save file with that name already exists. Do you want to overwrite it? (Enter 'yes' or 'no')");
+                    Console.WriteLine("\nA save file with that name already exists. Do you want to overwrite it? (Enter 'yes' or 'no'):");
                     string overwriteChoice = Console.ReadLine();
 
                     if (overwriteChoice == "yes")
                     {
-                        File.Delete(saveFilePath);
+                        // delete each file in existingSaveFiles
+                        foreach (string file in existingSaveFiles)
+                        {
+                            File.Delete(file);
+                        }
                     }
                     else
                     {
@@ -144,32 +153,54 @@ class Program
                     }
                 }
 
-                sftp.DownloadFile(selectedFile, File.OpenWrite(saveFilePath));
+                // download most recent file from /saves/{saveName}
+                var saveFiles = sftp.ListDirectory($"/saves/{selectedSave.Name}").Where(file => file.Name != "." && file.Name != "..").ToList();
+                var latestFileName = saveFiles.OrderByDescending(f => f.Name).First().Name;
 
-                 //Store the path to the downloaded save file in the config
-                config.SaveFilePath = saveFilePath;
+                Console.Write($"\nDownloading {selectedSave.Name} to {saveFilePath}...");
+                
+                sftp.DownloadFile($"/saves/{selectedSave.Name}/{latestFileName}", File.OpenWrite(saveFilePath));
+
+                Console.Write("Done!\n");
+
+                config.SaveName = selectedSave.Name;
             }
             else
             {
-                Console.WriteLine("List of .sav files in the local save games folder:");
-                string[] savFiles = Directory.GetFiles(firstDirectory, "*.sav");
+                Console.WriteLine("List of local saves:");
+                string[] savFiles = Directory.GetFiles(firstDirectory, "*_autosave_*.sav");
 
-                for (int i = 0; i < savFiles.Length; i++)
+                if (savFiles.Length == 0)
                 {
-                    Console.WriteLine($"{i + 1}. {Path.GetFileName(savFiles[i])}");
+                    Console.WriteLine("No save files found.");
+                    Environment.Exit(0);
+                }
+                // remove file path and "_autosave*" 
+                string[] saveNames = savFiles.Select(f =>
+                {
+                    int index = f.IndexOf("_autosave");
+                    return index >= 0 ? f.Substring(0, index) : f;
+                }).Distinct().Select(f => Path.GetFileName(f)).ToArray();
+
+                //savFiles = savFiles.GroupBy(f => f.Substring(0, f.IndexOf("_autosave"))).Select(g => g.First()).ToArray();
+                //string[] saveNames = savFiles.Select(f => f.Substring(0, f.IndexOf("_autosave"))).Distinct().ToArray();
+
+                for (int i = 0; i < saveNames.Length; i++)
+                {
+                    // remove the rest of the filename starting at _autosave* and print the name of the save
+                    Console.WriteLine($"{i + 1}. {saveNames[i]}");
                 }
 
-                Console.WriteLine("Enter the number of the .sav file you want to upload:");
-                int selectedSavFileIndex = int.Parse(Console.ReadLine());
+                Console.WriteLine("Enter the number of the save you want to upload:");
+                int selectedSaveNameIndex = int.Parse(Console.ReadLine());
 
-                 //Get the path of the selected .sav file
-                string selectedSavFile = savFiles[selectedSavFileIndex - 1];
-                string saveFilePath = Path.Combine(firstDirectory, Path.GetFileName(selectedSavFile));
-
-                //sftp.UploadFile(File.OpenRead(selectedSavFile), "/saves/test");
+                string selectedSaveName = saveNames[selectedSaveNameIndex - 1];
+                string saveFilePath = Path.Combine(firstDirectory, GetLatestSave(selectedSaveName));
 
                  //Store the path to the uploaded .sav file in the config
-                config.SaveFilePath = saveFilePath;
+                config.SaveName = selectedSaveName;
+
+                UploadProcess(sftp, config);
             }
 
             sftp.Disconnect();
@@ -181,44 +212,82 @@ class Program
 
         return config;
     }
-      static void DownloadProcess(SftpClient sftp, Config config)
+
+    static string? GetLatestSave(string saveName)
     {
-        sftp.Connect();
+        string saveGamesDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FactoryGame", "Saved", "SaveGames");
+        string saveDirectory = Directory.GetDirectories(saveGamesDirectory).FirstOrDefault();
 
-        var saveName = Path.GetFileNameWithoutExtension(config.SaveFilePath);
-        var saveFileName = Path.GetFileName(config.SaveFilePath);
-        var localWriteTime = File.GetLastWriteTime(config.SaveFilePath);
+        // get list of files in the saveDirectory starting with saveName
+        var saveFiles = Directory.GetFiles(saveDirectory, saveName + "*_autosave_*.sav");
 
-        if (!sftp.Exists($"/saves/{saveName}"))
+        // if no files, return null
+        if (saveFiles.Length == 0)
         {
-            Console.WriteLine($"No save files found on server for {saveName}");
+            return null;
+        }
+
+        // get the one with the latest last write time
+        var latestFile = saveFiles.OrderByDescending(f => File.GetLastWriteTime(f)).First();
+
+        // return the path to that file
+        return latestFile;
+    }
+
+    static bool Connect(Config config, SftpClient sftp)
+    {
+        Console.Write($"Connecting to {config.Username}@{config.Host}...");
+
+        try
+        {
+            sftp.Connect();
+            Console.Write(" Connected!\n");
+            return true;
+        } catch (Exception e)
+        {
+            Console.Write($" Failed:\n {e.Message}");
+            return false;
+        }
+    }
+    static void DownloadProcess(SftpClient sftp, Config config)
+    {
+        Connect(config, sftp);
+
+        var saveFilePath = GetLatestSave(config.SaveName);
+        var saveName = Path.GetFileNameWithoutExtension(saveFilePath);
+        var saveFileName = Path.GetFileName(saveFilePath);
+        var localWriteTime = File.GetLastWriteTime(saveFilePath);
+
+        if (!sftp.Exists($"/saves/{config.SaveName}"))
+        {
+            Console.WriteLine($"No save files found on server for {config.SaveName}");
             return;
         }
 
-        var sftpFiles = sftp.ListDirectory($"/saves/{saveName}").ToList();
+        var sftpFiles = sftp.ListDirectory($"/saves/{config.SaveName}").ToList();
         if (sftpFiles.Count > 0)
         {
             var remoteFile = sftpFiles.OrderByDescending(f => f.Name).First();
             
-            DateTime remoteWriteTime = DateTime.ParseExact(remoteFile.Name.Replace(".sav", ""), "yyyy-MM-dd_HH-mm-ss", CultureInfo.InvariantCulture);
+            DateTime remoteWriteTime = DateTime.ParseExact(remoteFile.Name.Replace(".sav", ""), "yyMMdd-HHmmss", CultureInfo.InvariantCulture);
             
             if (remoteWriteTime > localWriteTime)
             {
-                string backupFilePath = config.SaveFilePath + ".backup";
-                File.Move(config.SaveFilePath, backupFilePath);
+                string backupFilePath = saveFilePath + ".backup";
+                File.Move(saveFilePath, backupFilePath);
 
-                var saveFileOutput = File.OpenWrite(config.SaveFilePath);
+                var saveFileOutput = File.OpenWrite(saveFilePath);
                 sftp.DownloadFile(remoteFile.FullName, saveFileOutput);
 
                 var localTime = remoteWriteTime.ToLocalTime();
-                Console.WriteLine($"\nDownloaded latest version of {saveName} (Last updated {localTime.Month}/{localTime.Day}/{localTime.Year} {localTime.Hour}:{localTime.Minute})");
+                Console.WriteLine($"\nDownloaded latest version of {config.SaveName} (Last updated {localTime.Month}/{localTime.Day}/{localTime.Year} {localTime.Hour}:{localTime.Minute})");
             } else
             {
-                Console.WriteLine($"You have the most recent version of {saveName}. Skipping download.");
+                Console.WriteLine($"\nYou have the most recent version of {config.SaveName}.");
             }
         } else
         {
-            Console.WriteLine($"No save files found on server for {saveName}");
+            Console.WriteLine($"No save files found on server for {config.SaveName}");
         }
 
         sftp.Disconnect();
@@ -229,6 +298,7 @@ class Program
         var appId = "526870";
         var gameProcessName = "FactoryGame";
 
+        Console.Write("\nStarting Satisfactory...");
         try
         {
             Process.Start(new ProcessStartInfo
@@ -247,44 +317,48 @@ class Program
                 Thread.Sleep(1000); // Check every second
             }
 
-            Console.WriteLine("Satisfactory started.");
+            Console.Write(" Started\n\n");
 
             // Wait for the game to exit
             gameProcess.WaitForExit();
-            Console.WriteLine("Game exited.");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"An error occurred: {ex.Message}");
+            Console.Write($" Failed. \nError: {ex.Message}\n");
+            Console.WriteLine("\nPress any key to exit...");
+            Console.ReadKey();
         }
     }
 
     static void UploadProcess(SftpClient sftp, Config config)
     {
-        // get name of file from config.SaveFilePath
-        string fileName = Path.GetFileName(config.SaveFilePath);
-        string saveName = Path.GetFileNameWithoutExtension(config.SaveFilePath);
+        string saveName = config.SaveName;
+        string savePath = GetLatestSave(saveName);
+        string fileName = Path.GetFileName(savePath);
 
         // get timestamp of file last modified time
-        DateTime localWriteTime = File.GetLastWriteTime(config.SaveFilePath);
-        string timestring = localWriteTime.ToString("yyyy-MM-dd_HH-mm-ss");
+        DateTime localWriteTime = File.GetLastWriteTime(savePath);
+        string timestring = localWriteTime.ToString("yyMMdd-HHmmss");
+
+        Connect(config, sftp);
 
         if (!sftp.Exists($"/saves/{saveName}"))
         {
             sftp.CreateDirectory($"/saves/{saveName}");
         }
 
-        var sftpFiles = sftp.ListDirectory($"/saves/{saveName}").ToList();
+        var sftpFiles = sftp.ListDirectory($"/saves/{saveName}").Where(file => file.Name != "." && file.Name != "..").ToList();
+
         if (sftpFiles.Count > 0)
         {
             var remoteFile = sftpFiles.OrderByDescending(f => f.Name).First();
 
-            DateTime remoteWriteTime = DateTime.ParseExact(remoteFile.Name.Replace(".sav", ""), "yyyy-MM-dd_HH-mm-ss", CultureInfo.InvariantCulture);
+            DateTime remoteWriteTime = DateTime.ParseExact(remoteFile.Name.Replace(".sav", ""), "yyMMdd-HHmmss", CultureInfo.InvariantCulture);
 
             if (localWriteTime < remoteWriteTime)
             {
                 Console.WriteLine($"Uh oh... You have an older version of {saveName}. Skipping upload.");
-                string backupFilePath = config.SaveFilePath + ".backup";
+                string backupFilePath = savePath + ".backup";
 
                 if (File.Exists(backupFilePath))
                 {
@@ -292,7 +366,7 @@ class Program
                     File.Delete(backupFilePath);
                 }
 
-                File.Copy(config.SaveFilePath, backupFilePath);
+                File.Copy(savePath, backupFilePath);
                 Console.WriteLine($"Your local version has been backed up at {backupFilePath}.");
 
                 return;
@@ -300,9 +374,11 @@ class Program
         }
 
         Console.Write($"\nUploading {saveName}... ");
-        sftp.UploadFile(File.OpenRead(config.SaveFilePath), $"/saves/{saveName}/{timestring}.sav");
+        
+        sftp.UploadFile(File.OpenRead(savePath), $"/saves/{saveName}/{timestring}.sav");
+        sftp.Disconnect();
 
-        Console.Write("Done!");
+        Console.Write("Done");
     }
 
     static ConnectionInfo? GetConnectionInfo(Config config)
@@ -329,5 +405,5 @@ class Config
 {
     public string Host { get; set; }
     public string Username { get; set; }
-    public string SaveFilePath { get; set; }
+    public string SaveName { get; set; }
 }
