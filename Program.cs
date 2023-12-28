@@ -114,7 +114,7 @@ class Program
             }
 
             Console.WriteLine("\nExiting...");
-            Thread.Sleep(2500);
+            Thread.Sleep(2000);
         } catch (Exception e)
         {
             LogError(e.Message);
@@ -375,7 +375,7 @@ class Program
             return sftp;
         } catch (Exception e)
         {
-            WriteColor($" Failed: {e.Message}\n", ConsoleColor.Red);
+            WriteColor($" Failed\n Error: {e.Message}\n", ConsoleColor.Red);
             return null;
         }
     }
@@ -386,6 +386,12 @@ class Program
 
         using (var sftp = Connect(config.Host, config.Username))
         {
+            if (sftp == null)
+            {
+                LogError("Failed to connect to SFTP server.");
+                return;
+            }
+
             if (!sftp.Exists($"/saves/{config.SaveName}"))
             {
                 LogMessage($"No save files found on server for {config.SaveName}\n", ConsoleColor.Yellow);
